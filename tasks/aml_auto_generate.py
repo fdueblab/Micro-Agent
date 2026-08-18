@@ -1,13 +1,15 @@
 """算法模型想定式开发 — prompt 构建。
 
-v5 架构版本：
+v6 架构版本：
 - 支持算法类别 (algorithm_category) 与类别特定参数 (category_params)
 - 公共参数 + 类别特定参数的分层注入
-- 多阶段引导式执行（需求分析 → 技术选型 → 架构设计 → 代码生成 → 自检）
+- 多阶段引导式执行（需求分析 → 技术选型 → 测试设计 → 代码生成 → 真实执行验证）
 - 代码规范通过 Skill 注入（algorithm_code_standards）
 - 领域知识通过 RAG 预检索 (rag_context) + Agent 内部 RAG 双通道注入
 - 强制技术引导：Skill/RAG 包含技术路线时必须优先采用
 - 通用负面约束：禁止随机/占位符分类逻辑、禁止虚假实现
+- 测试驱动生成：先生成测试用例，再生成代码，最后用测试验证代码正确性
+- 真实执行验证：py_compile + import + 功能测试，失败自动重试修复
 """
 
 from __future__ import annotations
@@ -312,21 +314,94 @@ def build_aml_auto_generate_prompt(
 - 哪些函数作为独立可封装的核心 API
 - `main_process` 主入口的职责边界{skill_guidance}{constraint_enforcement}
 
+### 步骤 2b：设计测试用例（在生成代码之前）
+基于输入输出规格，先设计至少 3 组测试用例并写入测试文件。测试用例是后续验证代码正确性的标准，代码必须全部通过。
+
+**设计要求：**
+- 测试 1（正常输入）：构造一个应触发默认/正常结果的输入，验证输出结构和值
+- 测试 2（边界/触发输入）：构造一个应触发某个特定结果的输入，验证输出值符合预期
+- 测试 3（异常/空输入）：构造空值或异常输入，验证不崩溃且有合理输出
+
+**将测试用例写入** `{workspace}/temp/{{model_name}}_test.py`，格式示例（根据实际规格调整）。
+
+**重要：如果模型名称包含连字符、中文等非法字符，必须先转为合法 Python 模块名（仅小写字母、数字、下划线）。** 例如 `ZWH-未知领域-001` 应转为 `zwh_unknown_domain_001`，代码文件和测试文件都使用转换后的名称。下方模板中的 `{{model_name}}` 占位符需替换为转换后的实际模块名。
+```python
+import sys
+sys.path.insert(0, '.')
+from {{model_name}}_algorithm import main_process
+
+def test_normal_input():
+    # 测试正常输入应返回默认/正常结果
+    # 用基于输入规格的真实测试数据替换下方参数
+    result = main_process()
+    assert isinstance(result, dict), f'返回类型错误: {{type(result)}}'
+    assert 'classification_label' in result, '缺少 classification_label 字段'
+    assert all(l in ['正常','可疑','高风险','疑似欺诈'] for l in result['classification_label']), '标签不在允许范围'
+    assert all(0 <= c <= 1 for c in result['confidence_list']), '置信度不在 0~1 范围'
+    print('test_normal_input 通过:', result)
+
+def test_trigger_input():
+    # 构造应触发特定结果的输入
+    # 用基于输入规格的、应触发特定结果的测试数据替换下方参数
+    result = main_process()
+    assert len(result['classification_label']) > 0, '分类标签为空'
+    print('test_trigger_input 通过:', result)
+
+def test_empty_input():
+    # 空值/异常输入不应崩溃
+    result = main_process()
+    assert isinstance(result, dict), '空输入返回类型错误'
+    print('test_empty_input 通过:', result)
+
+if __name__ == '__main__':
+    test_normal_input()
+    test_trigger_input()
+    test_empty_input()
+    print('=== 所有测试通过 ===')
+```
+
+**重要：测试数据要基于算法的输入输出规格构造，不能用占位符。**
+
 ### 步骤 3：生成算法代码
 生成完整 Python 单文件代码，必须严格遵守已加载的 Skill 中的所有要求。
 如果系统加载了领域 Skill（如视频处理、姿态估计等），**必须** 参考其中的代码范例和技术路线。
+生成的代码必须能通过步骤 2b 中设计的所有测试用例。
 
 ### 步骤 4：保存代码文件
-使用 bash 工具将代码写入 `{workspace}/temp/{model_name}_algorithm.py`。
+使用 bash 工具将代码写入 `{workspace}/temp/{{model_name}}_algorithm.py`（使用转换后的模块名作为文件名）。
 
-### 步骤 5：代码质量自检（七维）
-对生成的代码逐项分析：
-1. 功能测试：代码逻辑是否正确实现了用户需求
-2. 平台提交规范：是否符合 `main_process` 入口、Google docstring 等要求
-3. 接口测试：函数签名和返回值是否匹配输入输出规格
-4. 性能测试：是否有明显的性能瓶颈或资源浪费
-5. 可靠性测试：是否有适当的异常处理和边界情况处理
-6. 安全性测试：是否有注入风险或不安全的外部调用
+### 步骤 5：代码验证（真实执行）
+**必须使用 bash 工具真实执行以下验证，不能跳过。如果验证失败，回到步骤 3 修复代码后重新保存并重新验证。**
+
+#### 5.1 语法编译检查
+使用 bash 工具执行：
+python3 -m py_compile {workspace}/temp/{{model_name}}_algorithm.py
+
+如果编译失败（有语法错误），回到【步骤 3】修复后重新保存。最多重试 3 次。
+
+#### 5.2 导入测试
+使用 bash 工具执行：
+cd {workspace}/temp && python3 -c "import {{model_name}}_algorithm; print('导入成功')"
+
+如果导入失败（缺少依赖或模块结构错误），回到【步骤 3】修复后重新保存。最多重试 3 次。
+
+#### 5.3 功能测试
+执行步骤 2b 中设计的测试文件，验证代码功能正确性：
+
+cd {workspace}/temp && python3 {{model_name}}_test.py
+
+该测试文件包含至少 3 组测试用例（正常输入、触发输入、空输入），使用 assert 断言验证输出结构和语义。
+
+如果测试失败（assert 错误或异常），分析失败原因，回到【步骤 3】修复代码后重新保存，再次执行测试。最多重试 3 次。
+
+#### 5.4 七维质量分析
+基于 5.1-5.3 的真实执行结果，对代码逐项分析：
+1. 语法编译检查：py_compile 执行结果
+2. 导入测试：import 执行结果
+3. 功能测试：测试用例执行结果
+4. 平台提交规范：是否符合 `main_process` 入口、Google docstring 等要求
+5. 接口测试：函数签名和返回值是否匹配输入输出规格
+6. 可靠性测试：是否有适当的异常处理和边界情况处理
 7. 兼容性测试：依赖库版本是否兼容、是否跨平台
 
 ### 步骤 6：保存最终结果
@@ -335,7 +410,7 @@ def build_aml_auto_generate_prompt(
 {{{{
     "model_name": "{model_name}",
     "generated_code": "<完整代码>",
-    "code_filename": "{model_name}_algorithm.py",
+    "code_filename": "{{model_name}}_algorithm.py",
     "model_summary": {{{{
         "purpose": "用非技术用户能理解的中文说明：这个算法模型主要帮助用户完成什么任务",
         "input_description": "说明用户需要提供什么数据或材料，不要出现 bash、py_compile 等命令行细节",
@@ -345,7 +420,13 @@ def build_aml_auto_generate_prompt(
         "next_steps": ["建议用户后续补充的数据、规则或评价指标"]
     }}}},
     "test_results": [
-        {{{{"name": "功能测试", "status": "passed", "description": "...", "details": "..."}}}}
+        {{{{"name": "语法编译检查", "status": "passed", "details": "py_compile 执行结果..."}}}},
+        {{{{"name": "导入测试", "status": "passed", "details": "导入成功..."}}}},
+        {{{{"name": "功能测试", "status": "passed", "details": "所有测试用例通过..."}}}},
+        {{{{"name": "平台提交规范", "status": "passed", "details": "..."}}}},
+        {{{{"name": "接口测试", "status": "passed", "details": "..."}}}},
+        {{{{"name": "可靠性测试", "status": "passed", "details": "..."}}}},
+        {{{{"name": "兼容性测试", "status": "passed", "details": "..."}}}}
     ],
     "references": [
         {{{{
@@ -389,6 +470,8 @@ def build_aml_auto_generate_prompt(
 5. 如果有技术约束，在步骤 2 中必须逐条说明如何满足
 6. 若用户提供了「相关资料」，必须遵守上方「差异化与知识产权要求」，并完整填写 differentiation_summary
 7. 面向用户展示的 model_summary 必须通俗、简洁、可操作，不得暴露命令行执行过程或源码写入过程
+8. 步骤 5 的代码验证必须真实执行，不能跳过。如果验证失败，必须回到步骤 3 修复代码后重新保存并重新验证。test_results 必须如实记录每次验证的真实结果（passed/failed），不得伪造结果
+9. 步骤 2b 的测试用例必须在生成代码之前完成，测试数据要基于输入输出规格构造真实数据，不能用占位符。步骤 5.3 必须执行步骤 2b 生成的测试文件，且所有测试必须通过
 
 ## 硬性禁止（违反任一条将导致代码不合格）
 1. **禁止**使用 `random.choice()` / `random.randint()` / `random.uniform()` 作为分类、检测或预测的核心决策逻辑

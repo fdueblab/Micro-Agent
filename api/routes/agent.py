@@ -589,7 +589,7 @@ async def _get_aml_retriever():
     from micro_agent.core.rag.embedding import EmbeddingRetriever
     _aml_retriever = EmbeddingRetriever(
         model=config.rag.embedding_model,
-        chunk_size=250,
+        chunk_size=config.rag.chunk_size,
         api_key=config.llm.api_key,
         base_url=config.llm.base_url,
     )
