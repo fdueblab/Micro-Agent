@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from typing import Any, Optional
 
 from loguru import logger
@@ -23,7 +22,7 @@ _DESCRIPTION = """在终端中执行 bash 命令。
 class _BashSession:
     """持久化的 bash 会话。通过 sentinel 标记检测命令完成。"""
 
-    _SENTINEL = "EXIT_SENTINEL_MARKER"
+    _SENTINEL = "<<exit>>"
 
     def __init__(self, timeout: float = 120.0):
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -33,21 +32,13 @@ class _BashSession:
     async def start(self) -> None:
         if self._process and self._process.returncode is None:
             return
-        if sys.platform == "win32":
-            self._process = await asyncio.create_subprocess_shell(
-                "bash",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            self._process = await asyncio.create_subprocess_shell(
-                "/bin/bash",
-                preexec_fn=os.setsid,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        self._process = await asyncio.create_subprocess_shell(
+            "/bin/bash",
+            preexec_fn=os.setsid,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         self._timed_out = False
 
     async def run(self, command: str) -> ToolResult:
