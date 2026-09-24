@@ -13,6 +13,7 @@
   POST /api/agent/aml_report                 文件/URL → AML 报告生成
   POST /api/agent/aml_model_evaluation       表单+文件/URL → AML 模型评测（支持数据适配）
   POST /api/agent/aml_auto_generate            表单+文件 → 算法模型想定式开发
+  POST /api/agent/aml_algorithm_eval           文件+表单 → 算法模型确定性评测（非 LLM）
   POST /api/agent/meta_app/run               表单+数据文件 → 元应用执行
   POST /api/agent/capability_describe        表单 → 能力描述翻译（直接 LLM）
   POST /api/agent/capability_chat            表单 → 引导式问答（直接 LLM）
@@ -589,7 +590,7 @@ async def _get_aml_retriever():
     from micro_agent.core.rag.embedding import EmbeddingRetriever
     _aml_retriever = EmbeddingRetriever(
         model=config.rag.embedding_model,
-        chunk_size=250,
+        chunk_size=config.rag.chunk_size,
         api_key=config.llm.api_key,
         base_url=config.llm.base_url,
     )
@@ -619,6 +620,7 @@ async def aml_auto_generate(
     paper_content = ""
     dataset_info: dict = {}
     reference_materials = ""
+    dataset_saved_path = ""
 
     try:
         if file and file.filename:
@@ -636,6 +638,7 @@ async def aml_auto_generate(
                 raise HTTPException(400, f"不支持的数据集格式: {ds_ext}")
             ds_saved = await save_upload(dataset_file, Path(WORKSPACE) / "temp")
             cleanup_files.append(str(ds_saved))
+            dataset_saved_path = str(ds_saved)
             dataset_info = parse_dataset_file(str(ds_saved))
             logger.info(f"数据集文件已解析: {dataset_info.get('format', '?')}, "
                         f"rows={dataset_info.get('total_rows', '?')}")
@@ -665,12 +668,18 @@ async def aml_auto_generate(
         url_list = _parse_json_form(reference_urls) or []
         if isinstance(url_list, str):
             url_list = [url_list]
-        for url in url_list:
+        references_dir = Path(WORKSPACE) / "temp" / "references"
+        for url_idx, url in enumerate(url_list):
             if not url:
                 continue
             url_text = await fetch_url_text(str(url))
             if url_text.strip():
                 reference_sections.append(f"【参考网址：{url}】\n{url_text}")
+                # URL 抓取文本落盘，供步骤 5.5 IP 相似度比对使用
+                references_dir.mkdir(parents=True, exist_ok=True)
+                url_file = references_dir / f"url_{url_idx}.txt"
+                url_file.write_text(url_text[:8000], encoding="utf-8")
+                cleanup_files.append(str(url_file))
             else:
                 reference_sections.append(f"【参考网址：{url}】（未能抓取内容，请仅作链接参考）")
             ref_keywords.append(str(url))
@@ -714,6 +723,27 @@ async def aml_auto_generate(
 
         llm_profile = "reasoning"
 
+        # 写入外部评测输入元数据（步骤 5.5：Agent 通过 bash 调用评测 CLI 时使用）
+        eval_inputs_name = f"aml_eval_inputs_{uuid.uuid4().hex[:8]}.json"
+        eval_inputs_path = Path(WORKSPACE) / "temp" / eval_inputs_name
+        eval_inputs_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_inputs_path.write_text(
+            json.dumps(
+                {
+                    "algorithm_category": algorithm_category,
+                    "category_params": parsed_category_params,
+                    "constraints": list(parsed_category_params.get("constraints") or []),
+                    "dataset_path": dataset_saved_path,
+                    "references_dir": (
+                        str(references_dir) if reference_sections else ""
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cleanup_files.append(str(eval_inputs_path))
+
         agent, sid = await build_agent(
             name="aml_auto_generate",
             system_prompt=AML_AUTO_GENERATE_SYSTEM_PROMPT,
@@ -750,6 +780,8 @@ async def aml_auto_generate(
             category_params=parsed_category_params,
             rag_context=rag_context,
             reference_materials=reference_materials,
+            project_root=str(Path(__file__).resolve().parents[2]),
+            eval_inputs_path=str(eval_inputs_path),
         )
 
         ctx = await task_manager.submit(agent, prompt)
@@ -818,6 +850,95 @@ def _parse_json_form(value: str) -> list | dict | None:
         return json.loads(value)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+# ============================================================
+#  端点：算法模型外部确定性评测（非 LLM，供前端/人工调用）
+# ============================================================
+
+@router.post("/aml_algorithm_eval")
+async def aml_algorithm_eval(
+    code: UploadFile = File(..., description="被测算法 .py 源码文件"),
+    test: UploadFile = File(None, description="Agent 编写的测试文件（可选）"),
+    algorithm_category: str = Form(""),
+    category_params: str = Form(""),
+    constraints: str = Form(""),
+    dataset_file: UploadFile = File(None),
+    reference_files: list[UploadFile] = File(default=[]),
+):
+    """对生成的算法模型执行确定性评测：反作弊扫描、约束校验、标签契约、
+    独立子进程导入/测试执行、数据集 holdout 评测与基线对比、IP 代码相似度。"""
+    from micro_agent.evaluation.evaluator import EvaluationInput, run_evaluation
+
+    eval_root = Path(WORKSPACE) / "temp" / "eval" / uuid.uuid4().hex[:12]
+    eval_root.mkdir(parents=True, exist_ok=True)
+
+    if not code or not code.filename or not code.filename.lower().endswith(".py"):
+        cleanup_paths(eval_root)
+        raise HTTPException(400, "请上传 .py 格式的算法源码文件")
+
+    try:
+        from api.services.files import _safe_filename
+
+        code_path = await save_upload(code, eval_root)
+        # save_upload 会加时间戳前缀；恢复原始文件名，
+        # 保证测试文件中的 `from {model}_algorithm import ...` 仍然成立
+        orig_name = _safe_filename(code.filename, default="algorithm_under_test.py")
+        if not orig_name.lower().endswith(".py"):
+            orig_name += ".py"
+        if code_path.name != orig_name:
+            proper = eval_root / orig_name
+            code_path = code_path.rename(proper)
+
+        test_path = None
+        if test and test.filename:
+            test_path = await save_upload(test, eval_root)
+
+        dataset_path = None
+        if dataset_file and dataset_file.filename:
+            dataset_path = await save_upload(dataset_file, eval_root)
+
+        reference_texts: list[tuple[str, str]] = []
+        for rf in reference_files or []:
+            if not rf or not getattr(rf, "filename", None):
+                continue
+            rf_saved = await save_upload(rf, eval_root)
+            text = read_reference_text(str(rf_saved))
+            if text.strip():
+                reference_texts.append((rf.filename, text))
+
+        params = _parse_json_form(category_params) or {}
+        if not isinstance(params, dict):
+            params = {}
+        cons_list: list[str] = []
+        if constraints and constraints.strip():
+            cons_list = [c.strip() for c in constraints.split(",") if c.strip()]
+        elif isinstance(params.get("constraints"), list):
+            cons_list = [str(c) for c in params["constraints"]]
+
+        inp = EvaluationInput(
+            code_path=code_path,
+            test_path=test_path,
+            algorithm_category=algorithm_category or "",
+            category_params=params,
+            constraints=cons_list,
+            dataset_path=dataset_path,
+            reference_texts=reference_texts,
+            eval_dir=eval_root / "worker",
+        )
+        report = await run_evaluation(inp)
+        logger.info(
+            f"算法评测完成: verdict={report.get('verdict')}, "
+            f"summary={report.get('summary')}"
+        )
+        return report
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"算法评测失败: {e}", exc_info=True)
+        raise HTTPException(500, f"评测执行失败: {e}")
+    finally:
+        cleanup_paths(eval_root)
 
 
 # ============================================================

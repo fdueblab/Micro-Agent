@@ -39,7 +39,7 @@ def test_config_memory_field():
 def test_config_rag_field():
     from micro_agent.core.config import config
     assert hasattr(config, "rag")
-    assert config.rag.embedding_model == "openrouter/openai/text-embedding-3-small"
+    assert config.rag.embedding_model == "openai/text-embedding-v3"
 
 
 def test_config_skills_field():
