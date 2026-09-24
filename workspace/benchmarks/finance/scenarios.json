@@ -1,0 +1,82 @@
+{
+  "description": "金融垂域标准评测想定集。每个想定 = 合成数据集 + 金融规则/朴素基线 + 期望规格。配合 micro_agent/evaluation/finance_benchmark.py 使用。",
+  "scenarios": [
+    {
+      "id": "S1_suspicious_txn",
+      "name": "跨境可疑交易监测",
+      "category": "classification",
+      "narrative": "识别跨境支付中的可疑交易。正常交易占多数，可疑交易具有大额、高风险地区对手方、短时高频、多币种分散等特征（也存在规则难以覆盖的小额高频拆分模式）。算法读入单笔交易特征，输出 normal 或 suspicious。",
+      "labels": ["normal", "suspicious"],
+      "positive_class": "suspicious",
+      "dataset": "s1_suspicious_txn.csv",
+      "input_columns": ["txn_id", "amount", "currency", "counterparty_country", "txn_count_24h", "distinct_currency_7d", "avg_amount_30d", "night_flag"],
+      "label_column": "label",
+      "output_key": "classification_label",
+      "score_key": "confidence",
+      "baseline": {"type": "rule", "expr": "amount_usd > 10000", "description": "大额阈值规则(1万美元)"},
+      "metrics": ["pr_auc", "ks", "recall_at_precision_30", "accuracy"],
+      "expectations": {"must_beat_baseline": ["pr_auc", "ks"], "min_ks": 0.3}
+    },
+    {
+      "id": "S2_credit_default",
+      "name": "信贷违约预测",
+      "category": "classification",
+      "narrative": "预测借款人是否违约。正类（违约）占比约 8%。违约客户呈现负债比高、收入低、近期多次逾期查询、信用卡使用率高的特征组合。",
+      "labels": ["repay", "default"],
+      "positive_class": "default",
+      "dataset": "s2_credit_default.csv",
+      "input_columns": ["customer_id", "loan_amount", "annual_income", "debt_ratio", "credit_utilization", "inquiries_6m", "delinquency_history", "employment_years"],
+      "label_column": "label",
+      "output_key": "classification_label",
+      "score_key": "confidence",
+      "baseline": {"type": "rule", "expr": "debt_ratio > 0.55 and credit_utilization > 0.8", "description": "高负债+高信用卡使用率规则"},
+      "metrics": ["pr_auc", "ks", "recall_at_precision_30", "accuracy"],
+      "expectations": {"must_beat_baseline": ["pr_auc", "ks"], "min_ks": 0.3}
+    },
+    {
+      "id": "S3_fx_forecast",
+      "name": "汇率次日预测",
+      "category": "regression",
+      "narrative": "基于过去 20 日的汇率与成交量特征，预测下一日美元/人民币收盘价。数据近似随机游走带轻微动量。",
+      "dataset": "s3_fx_forecast.csv",
+      "input_columns": ["date", "last_close", "mean5", "mean20", "vol20", "volume_z", "weekday"],
+      "target_column": "next_close",
+      "output_key": "prediction",
+      "baseline": {"type": "naive", "expr": "last_close", "description": "朴素基线(下一期=最后一期)"},
+      "metrics": ["mape", "direction_accuracy"],
+      "expectations": {"must_beat_baseline": [], "max_mape": 2.0, "min_direction_accuracy": 0.52, "mape_within_baseline_ratio": 1.05}
+    },
+    {
+      "id": "S4_doc_audit",
+      "name": "贸易单证审核",
+      "category": "classification",
+      "narrative": "审核跨境贸易结算单证是否合规。违规单证存在币种不一致、金额异常（负数/超大）、原产地缺失、超许可证额度等问题。部分字段存在脏值（字符串金额、缺失）。",
+      "labels": ["pass", "reject"],
+      "positive_class": "reject",
+      "dataset": "s4_doc_audit.csv",
+      "input_columns": ["doc_id", "invoice_currency", "declared_currency", "amount", "origin_country", "license_limit"],
+      "label_column": "label",
+      "output_key": "classification_label",
+      "score_key": "confidence",
+      "baseline": {"type": "rule", "expr": "invoice_currency != declared_currency or amount_usd > 500000", "description": "币种不一致或超50万美元规则"},
+      "metrics": ["pr_auc", "ks", "recall_at_precision_50", "accuracy"],
+      "expectations": {"must_beat_baseline": ["ks"], "min_ks": 0.4}
+    },
+    {
+      "id": "S5_sanction_screening",
+      "name": "制裁名单筛查",
+      "category": "detection",
+      "narrative": "判断交易对手方名称是否命中制裁名单。真实场景中名称存在大小写、空格、标点、别名（CO LTD/LIMITED）、音译变体，必须模糊匹配。数据中约 40% 为命中样本。",
+      "labels": ["clear", "hit"],
+      "positive_class": "hit",
+      "dataset": "s5_sanction_screening.csv",
+      "input_columns": ["txn_id", "counterparty_name"],
+      "label_column": "label",
+      "output_key": "classification_label",
+      "score_key": "confidence",
+      "baseline": {"type": "rule", "expr": "contains_any(counterparty_name, ['IRISL', 'KWEILIN', 'MARC RICH'])", "description": "精确子串匹配规则"},
+      "metrics": ["pr_auc", "ks", "recall_at_precision_50", "accuracy"],
+      "expectations": {"must_beat_baseline": ["recall_at_precision_50"], "min_ks": 0.4}
+    }
+  ]
+}

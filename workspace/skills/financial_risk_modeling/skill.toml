@@ -1,0 +1,13 @@
+name = "financial_risk_modeling"
+description = "金融风控建模指导：不平衡学习、评分卡、可疑交易监测范式"
+
+# prompt 留空 → 自动从同目录 SKILL.md 读取
+
+[metadata.match]
+# 不设 categories：避免污染非金融的分类/检测任务，仅靠金融关键词命中
+keywords = [
+    "风控", "风险", "欺诈", "欺诈检测", "反欺诈", "信用", "信用评分", "评分卡",
+    "违约", "不良", "可疑交易", "洗钱", "反洗钱", "aml", "风控模型",
+    "risk", "fraud", "credit", "scorecard", "default", "suspicious",
+    "imbalance", "不平衡", "smote", "ks", "psi", "recall",
+]

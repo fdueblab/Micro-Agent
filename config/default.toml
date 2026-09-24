@@ -37,7 +37,9 @@ duplicate_threshold = 2
 storage_dir = "data/memory"
 
 [rag]
-embedding_model = "openrouter/openai/text-embedding-3-small"
+# 通义千问 embedding（经 OpenAI 兼容端点，复用 LLM_API_KEY/BASE_URL）
+# 勿用 openrouter/ 前缀：OpenRouter 无 embedding 模型，请求必然 model_not_found
+embedding_model = "openai/text-embedding-v3"
 chunk_size = 500
 
 [skills]
