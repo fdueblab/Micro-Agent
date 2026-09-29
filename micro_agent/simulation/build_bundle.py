@@ -128,8 +128,9 @@ class BuildBundleStore:
     @staticmethod
     def _write_manifest(path: Path, data: Any) -> None:
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        with tmp.open("rb") as handle:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
 

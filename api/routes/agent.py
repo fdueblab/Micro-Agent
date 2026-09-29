@@ -139,6 +139,9 @@ async def _get_packaging_retriever():
 async def service_packaging(
     file: UploadFile = File(...),
     session_id: Optional[str] = Form(default=None),
+    domain: str = Form(default=""),
+    clinical_scope: str = Form(default=""),
+    input_summary: str = Form(default=""),
     packaging_spec: str = Form(default=""),
 ):
     spec = None
@@ -165,6 +168,8 @@ async def service_packaging(
         retriever = None
 
     skill_names = ["mcp_protocol", "docker_packaging", "code_analysis_patterns"]
+    if domain == "clinical":
+        skill_names.append("domain_clinical")
     llm_profile = "reasoning"
 
     agent, sid = await build_agent(
@@ -200,6 +205,14 @@ async def service_packaging(
             "明确报错并停止，不得编造实现或成功产物。工具名称、描述和参数应与本想定一致。"
             "在输出目录写入 mcp-manifest.json，包含想定及实际生成的工具信息。"
             "\n封装想定 JSON：\n" + json.dumps(spec, ensure_ascii=False)
+        )
+    if domain == "clinical":
+        prompt += (
+            "\n\n临床服务封装要求：只封装源代码实际具备的计算能力，不补造医学公式、参数或结论。"
+            "保留原始输入输出名称、单位、适用人群、限制和资料来源；资料不足时明确标注待核对。"
+            "不得在服务包中保存患者身份信息。"
+            f"\n临床适用范围：{clinical_scope[:1000] or '未提供'}"
+            f"\n输入输出说明：{input_summary[:1000] or '未提供'}"
         )
     ctx = await task_manager.submit(agent, prompt)
 
@@ -602,7 +615,7 @@ async def aml_model_evaluation(
 #  端点：算法模型想定式开发（支持会话记忆 + Skills + RAG）
 # ============================================================
 
-_aml_retriever = None
+_aml_retrievers = {}
 
 AML_AUTO_GENERATE_SYSTEM_PROMPT = (
     "你是一个专业的AI算法工程师 Agent，能够根据用户需求自动生成高质量的算法模型代码。"
@@ -615,32 +628,37 @@ AML_AUTO_GENERATE_SYSTEM_PROMPT = (
 )
 
 
-async def _get_aml_retriever():
+async def _get_aml_retriever(domain: str = ""):
     """延迟初始化算法模型知识库检索器（模块级单例）。"""
-    global _aml_retriever
-    if _aml_retriever is not None:
-        return _aml_retriever
+    key = "clinical" if domain == "clinical" else "general"
+    if key in _aml_retrievers:
+        return _aml_retrievers[key]
 
-    knowledge_dir = Path(config.workspace) / "knowledge" / "aml_auto_generate"
+    folder = "clinical_auto_generate" if key == "clinical" else "aml_auto_generate"
+    knowledge_dir = Path(config.workspace) / "knowledge" / folder
     if not knowledge_dir.exists():
         logger.warning(f"aml_auto_generate 知识库目录不存在: {knowledge_dir}")
         return None
 
     from micro_agent.core.rag.embedding import EmbeddingRetriever
-    _aml_retriever = EmbeddingRetriever(
+    retriever = EmbeddingRetriever(
         model=config.rag.embedding_model,
         chunk_size=config.rag.chunk_size,
         api_key=config.llm.api_key,
         base_url=config.llm.base_url,
     )
-    await _aml_retriever.load_directory(knowledge_dir)
-    return _aml_retriever
+    await retriever.load_directory(knowledge_dir)
+    _aml_retrievers[key] = retriever
+    return retriever
 
 
 @router.post("/aml_auto_generate")
 async def aml_auto_generate(
     model_name: str = Form(...),
     free_narrative: str = Form(...),
+    domain: str = Form(""),
+    clinical_task: str = Form(""),
+    generation_mode: str = Form("new_design"),
     industry: str = Form(""),
     scenario: str = Form(""),
     technology: str = Form(""),
@@ -730,18 +748,23 @@ async def aml_auto_generate(
             reference_materials = "\n\n".join(reference_sections)
             logger.info(f"已汇总参考资料 {len(reference_sections)} 项，共 {len(reference_materials)} 字符")
 
-        retriever = await _get_aml_retriever()
+        if domain == "clinical" and generation_mode not in ("reproduce", "new_design"):
+            raise HTTPException(400, "临床生成模式无效")
+        retriever = await _get_aml_retriever(domain)
 
         # Skill 匹配：通过 SkillRegistry 元数据自动选择（含 always_for）
         skill_names = _resolve_skills_for_category(
             algorithm_category, parsed_category_params, free_narrative,
             model_name=model_name,
         )
+        if domain == "clinical" and "domain_clinical" not in skill_names:
+            skill_names.append("domain_clinical")
         logger.info(f"自动匹配 Skill: {skill_names}")
 
         # RAG 预检索：用聚焦查询代替完整 prompt，提高检索精度
         rag_context = ""
         rag_docs = []
+        built_in_sources = []
         if retriever:
             rag_parts = [model_name, algorithm_category, free_narrative[:200]]
             cat_labels = parsed_category_params.get("labels") or []
@@ -759,6 +782,13 @@ async def aml_auto_generate(
                     f"RAG 预检索命中 {len(rag_docs)} 篇文档: "
                     f"{[d.source for d in rag_docs]}"
                 )
+        if domain == "clinical" and not rag_context:
+            knowledge_dir = Path(config.workspace) / "knowledge" / "clinical_auto_generate"
+            built_in_sources = [path.name for path in sorted(knowledge_dir.glob("*.md"))[:5]]
+            rag_context = "\n---\n".join(
+                f"[{path.name}] {path.read_text(encoding='utf-8')[:1800]}"
+                for path in sorted(knowledge_dir.glob("*.md"))[:5]
+            )[:7000]
 
         llm_profile = "reasoning"
 
@@ -785,7 +815,13 @@ async def aml_auto_generate(
 
         agent, sid = await build_agent(
             name="aml_auto_generate",
-            system_prompt=AML_AUTO_GENERATE_SYSTEM_PROMPT,
+            system_prompt=(
+                "你是临床算法工程师。仅根据有出处的公式、参数与适用条件生成算法；"
+                "资料不全时明确报告缺口，不得虚构临床效果。"
+                "论文复现必须保持原公式及参数，不自动改动算法。"
+                "用工具完成代码生成及质量分析，结束时调用 terminate。"
+                if domain == "clinical" else AML_AUTO_GENERATE_SYSTEM_PROMPT
+            ),
             max_steps=40,
             llm_profile=llm_profile,
             enable_session=True,
@@ -804,8 +840,28 @@ async def aml_auto_generate(
             "memory_loaded": len(agent.memory) if sid and session_id else 0,
             "session_id": sid,
             "session_resumed": bool(session_id),
+            "generation_evidence": {
+                "dataset": {
+                    "submitted": bool(dataset_file and dataset_file.filename),
+                    "parsed": bool(dataset_info and not str(dataset_info.get("raw_text", "")).startswith("(")),
+                    "format": dataset_info.get("format"),
+                    "rows": dataset_info.get("total_rows"),
+                    "columns": len(dataset_info.get("columns") or []),
+                    "usage": "字段及样例用于生成提示；未执行参数训练" if dataset_info else "未提交训练数据",
+                },
+                "references": {
+                    "user_materials": len(reference_sections),
+                    "rag_hits": len(rag_docs),
+                    "rag_sources": [str(doc.source) for doc in rag_docs],
+                    "rag_snippets": [" ".join(str(doc.content).split())[:120] for doc in rag_docs],
+                    "built_in_sources": built_in_sources,
+                    "context_included": bool(rag_context),
+                    "context_kind": "rag" if rag_docs else ("built_in" if rag_context else "none"),
+                },
+            },
         }
 
+        output_path = f"{WORKSPACE}/temp/aml_generate_{uuid.uuid4().hex}.json"
         prompt = build_aml_auto_generate_prompt(
             model_name=model_name,
             free_narrative=free_narrative,
@@ -821,18 +877,22 @@ async def aml_auto_generate(
             reference_materials=reference_materials,
             project_root=str(Path(__file__).resolve().parents[2]),
             eval_inputs_path=str(eval_inputs_path),
+            domain=domain,
+            clinical_task=clinical_task,
+            generation_mode=generation_mode,
+            result_path=output_path,
         )
 
         ctx = await task_manager.submit(agent, prompt)
 
         output_files = [
-            {"name": "aml_generate_result", "file": f"{WORKSPACE}/temp/aml_generate_result.json"},
+            {"name": "aml_generate_result", "file": output_path},
         ]
 
         return await sse_response(
             ctx,
             output_files=output_files,
-            cleanup=partial(cleanup_paths, *cleanup_files) if cleanup_files else None,
+            cleanup=partial(cleanup_paths, *cleanup_files, output_path),
             session_id=sid,
             components_meta=components_meta,
         )
@@ -1101,6 +1161,10 @@ async def mcp_packaging_intake(
     except (ValueError, TypeError) as exc:
         raise HTTPException(502, "想定助手返回内容无法解析") from exc
 
+
+# ============================================================
+#  端点：能力描述翻译（直接 LLM 调用）
+# ============================================================
 
 @router.post("/capability_describe")
 async def capability_describe(

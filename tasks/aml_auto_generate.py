@@ -172,6 +172,10 @@ def build_aml_auto_generate_prompt(
     reference_materials: str = "",
     project_root: str = "",
     eval_inputs_path: str = "",
+    domain: str = "",
+    clinical_task: str = "",
+    generation_mode: str = "new_design",
+    result_path: str = "",
 ) -> str:
     sections: list[str] = []
     params = category_params or {}
@@ -180,6 +184,7 @@ def build_aml_auto_generate_prompt(
     workspace = workspace.replace("\\", "/")
     project_root = project_root.replace("\\", "/")
     eval_inputs_path = eval_inputs_path.replace("\\", "/")
+    result_path = result_path.replace("\\", "/")
 
     # ── 基本元信息 ──
     header = f"""你是一个专业的AI算法工程师，需要根据用户的需求生成高质量的算法模型服务代码。
@@ -242,17 +247,29 @@ def build_aml_auto_generate_prompt(
             "用于指导本次算法模型的优化方向：\n\n"
             f"{reference_materials[:6000]}\n"
         )
+        if domain != "clinical":
+            sections.append(
+                "\n## 差异化与知识产权要求（必须严格遵守）\n\n"
+                "针对上述参考资料，你必须：\n"
+                "1. **参考但不照搬**：可以借鉴其中的思路、方法论与技术路线，"
+                "但严禁逐行复制其源码或直接实现受专利保护的具体方案；\n"
+                "2. **主动差异化创新**：至少在算法结构、关键步骤、特征工程、"
+                "优化策略或工程实现中的若干方面做出实质性改进与区别，避免与参考资料雷同；\n"
+                "3. **规避知识产权争议**：不得引入明显侵犯版权/专利的实现；"
+                "若参考资料含明确专利点，应采用替代方案绕开；\n"
+                "4. **可追溯说明**：在最终结果中明确记录参考了哪些资料、做了哪些差异化处理，"
+                "以备知识产权审查（填入下方 JSON 的 references 与 differentiation_summary 字段）。"
+            )
+
+    if domain == "clinical":
         sections.append(
-            "\n## 差异化与知识产权要求（必须严格遵守）\n\n"
-            "针对上述参考资料，你必须：\n"
-            "1. **参考但不照搬**：可以借鉴其中的思路、方法论与技术路线，"
-            "但严禁逐行复制其源码或直接实现受专利保护的具体方案；\n"
-            "2. **主动差异化创新**：至少在算法结构、关键步骤、特征工程、"
-            "优化策略或工程实现中的若干方面做出实质性改进与区别，避免与参考资料雷同；\n"
-            "3. **规避知识产权争议**：不得引入明显侵犯版权/专利的实现；"
-            "若参考资料含明确专利点，应采用替代方案绕开；\n"
-            "4. **可追溯说明**：在最终结果中明确记录参考了哪些资料、做了哪些差异化处理，"
-            "以备知识产权审查（填入下方 JSON 的 references 与 differentiation_summary 字段）。"
+            "\n## 临床任务与生成模式\n"
+            f"临床任务：{clinical_task or '未指定'}。生成模式：{generation_mode}。\n"
+            "reproduce 表示严格复现给出的公式、参数、适用人群和单位；"
+            "new_design 表示在有据可查的基础上提出方案。"
+            "不得把专利文本当作临床有效性证据。若必要参数缺失，明确列出并停止生成可用模型。"
+            "输出必须是单文件 Python，公开同步函数 main_process，命名参数仅使用 JSON 数值、整数、字符串、布尔值，"
+            "结果可直接序列化为 JSON。公式和评分优先用标准库实现；依赖模型权重时明确标记待部署，不得伪造权重。"
         )
 
     # ── 类别特定参数 ──
@@ -300,6 +317,23 @@ def build_aml_auto_generate_prompt(
             "\n- 必须逐条检查上方列出的技术约束，"
             "并为每条约束明确说明当前技术方案如何满足"
         )
+
+    clinical_reproduction = domain == "clinical" and generation_mode == "reproduce"
+    reference_instruction = (
+        "仅记录真实来源、原公式和原参数；what_added、what_improved 等差异化字段填写‘未修改原模型’，不得声称临床优势。"
+        if clinical_reproduction else
+        "在 references 中说明参考内容、实际新增内容和改进；没有证据时不要声称效果提升。"
+    )
+    differentiation_instruction = (
+        "论文复现时 differentiation_summary 记录‘严格复现、无算法改动’，无需创造差异化。"
+        if clinical_reproduction else
+        "differentiation_summary 说明实际设计选择；不要编造性能或临床效果。"
+    )
+    source_instruction = (
+        "用户提供参考资料时，核对公式、单位、参数、适用人群和来源，不得为了差异化改变原模型。"
+        if domain == "clinical" else
+        "用户提供参考资料时，遵守上方差异化与知识产权要求并完整填写 differentiation_summary。"
+    )
 
     # 外部确定性评测命令（步骤 5.5）：优先脚本绝对路径，任意工作目录均可执行
     if project_root:
@@ -469,7 +503,7 @@ cd {workspace}/temp && python3 {{model_name}}_test.py
 7. 兼容性测试：依赖库版本是否兼容、是否跨平台
 {eval_section_55}
 ### 步骤 6：保存最终结果
-使用 bash 工具将 JSON 写入 `{workspace}/temp/aml_generate_result.json`，格式：
+使用 bash 工具将 JSON 写入 `{result_path or f'{workspace}/temp/aml_generate_result.json'}`，格式：
 ```json
 {{{{
     "model_name": "{model_name}",
@@ -518,9 +552,8 @@ cd {workspace}/temp && python3 {{model_name}}_test.py
 ```
 说明：
 - test_code 必须与步骤 2b 实际写入测试文件的内容完全一致，用于平台留存测试资产、支持后续用真实数据集复检（缺失该字段视为结果不完整）。
-- 即使用户未提供参考资料，也应基于通用现有算法填写 references（来源标 RAG知识库 或常识）与 differentiation_summary，
-  说明本方案参考了什么、新增/提升了什么、对比现有算法有哪些特点与优势。
-- differentiation_summary 必须填写，用于向用户清晰展示「参考了…、新增了…、提升了…、对比优势…」。
+- {reference_instruction}
+- {differentiation_instruction}
 - model_summary 必须填写，且必须面向不懂技术的用户，避免展示 bash、cat、python3、py_compile、main_process 等命令行或工程实现细节。
 - 如果用户需求描述不完整、数据集缺失或参考资料不足，必须在 model_summary.limitations 与 model_summary.next_steps 中用友好语言说明。{eval_result_note}
 
@@ -535,7 +568,7 @@ cd {workspace}/temp && python3 {{model_name}}_test.py
 3. 如果 RAG 检索到了参考资料、用户提供了「相关资料」或 Skill 提供了技术指导，在 references 字段中列出，并填写 what_referenced/what_added/what_improved 等子字段
 4. 逐步执行，不要跳过任何步骤
 5. 如果有技术约束，在步骤 2 中必须逐条说明如何满足
-6. 若用户提供了「相关资料」，必须遵守上方「差异化与知识产权要求」，并完整填写 differentiation_summary
+6. {source_instruction}
 7. 面向用户展示的 model_summary 必须通俗、简洁、可操作，不得暴露命令行执行过程或源码写入过程
 8. 步骤 5 的代码验证必须真实执行，不能跳过。如果验证失败，必须回到步骤 3 修复代码后重新保存并重新验证。test_results 必须如实记录每次验证的真实结果（passed/failed），不得伪造结果
 9. 步骤 2b 的测试用例必须在生成代码之前完成，测试数据要基于输入输出规格构造真实数据，不能用占位符。步骤 5.3 必须执行步骤 2b 生成的测试文件，且所有测试必须通过{note_external_eval}
@@ -569,4 +602,19 @@ def _get_pose_detector():
 现在开始执行任务，请从【步骤 1】开始。
 """)
 
+    sections.append("""
+## 在线使用契约（写入同一个结果 JSON）
+结果 JSON 顶层额外包含：
+"algorithm_spec": {
+  "title": "模型名称", "description": "算法说明", "clinicalScope": "适用范围与限制",
+  "inputs": [{"name": "age", "label": "年龄", "type": "integer", "unit": "岁",
+              "description": "输入说明", "required": true, "options": []}],
+  "output": {"description": "输出含义及单位"}
+},
+"smoke_input": {"age": 40}
+上述输入字段按实际 main_process 参数逐个填写，顺序和名称完全一致；smoke_input 必须是真实可运行的无个人信息样例。
+在线使用目前支持 number、integer、string、boolean 类型的命名参数，以及 JSON 格式的返回值。
+需要上传文件、模型权重、多轮会话或额外依赖且当前运行环境无法满足时，不要虚构可运行样例；在 limitations 中说明待配置能力。
+不要填写假的测试通过结论。若无法提供完整契约，请在 limitations 中列出缺失项，不要编造字段。
+""")
     return "\n".join(sections)
