@@ -1,13 +1,15 @@
 """算法模型想定式开发 — prompt 构建。
 
-v5 架构版本：
+v6 架构版本：
 - 支持算法类别 (algorithm_category) 与类别特定参数 (category_params)
 - 公共参数 + 类别特定参数的分层注入
-- 多阶段引导式执行（需求分析 → 技术选型 → 架构设计 → 代码生成 → 自检）
+- 多阶段引导式执行（需求分析 → 技术选型 → 测试设计 → 代码生成 → 真实执行验证）
 - 代码规范通过 Skill 注入（algorithm_code_standards）
 - 领域知识通过 RAG 预检索 (rag_context) + Agent 内部 RAG 双通道注入
 - 强制技术引导：Skill/RAG 包含技术路线时必须优先采用
 - 通用负面约束：禁止随机/占位符分类逻辑、禁止虚假实现
+- 测试驱动生成：先生成测试用例，再生成代码，最后用测试验证代码正确性
+- 真实执行验证：py_compile + import + 功能测试，失败自动重试修复
 """
 
 from __future__ import annotations
@@ -168,9 +170,16 @@ def build_aml_auto_generate_prompt(
     category_params: Optional[dict] = None,
     rag_context: str = "",
     reference_materials: str = "",
+    project_root: str = "",
+    eval_inputs_path: str = "",
 ) -> str:
     sections: list[str] = []
     params = category_params or {}
+
+    # Windows 反斜杠路径会被 bash 转义吞掉，统一为正斜杠（Linux 无影响）
+    workspace = workspace.replace("\\", "/")
+    project_root = project_root.replace("\\", "/")
+    eval_inputs_path = eval_inputs_path.replace("\\", "/")
 
     # ── 基本元信息 ──
     header = f"""你是一个专业的AI算法工程师，需要根据用户的需求生成高质量的算法模型服务代码。
@@ -292,6 +301,55 @@ def build_aml_auto_generate_prompt(
             "并为每条约束明确说明当前技术方案如何满足"
         )
 
+    # 外部确定性评测命令（步骤 5.5）：优先脚本绝对路径，任意工作目录均可执行
+    if project_root:
+        eval_cmd = f"python3 {project_root}/micro_agent/evaluation/cli.py"
+    else:
+        eval_cmd = "python3 -m micro_agent.evaluation.cli"
+
+    # 步骤 5.5 文本：仅在生成流程传入 eval_inputs_path 时启用
+    eval_section_55 = ""
+    if eval_inputs_path:
+        eval_section_55 = f"""
+#### 5.5 外部确定性评测（平台强制，必须真实执行）
+使用 bash 工具执行平台评测脚本，对生成的算法做**独立于你自身的确定性检查**（反作弊扫描、约束校验、标签契约、数据集真实评测与基线对比、参考资料相似度/IP 检查）：
+
+{eval_cmd} --code {workspace}/temp/{{model_name}}_algorithm.py --test {workspace}/temp/{{model_name}}_test.py --inputs {eval_inputs_path} --out {workspace}/temp/{{model_name}}_eval_report.json
+
+要求：
+- `--inputs` 文件由平台自动生成（含算法类别、类别参数、技术约束、数据集与参考资料路径），直接使用，不要修改
+- 评测完成后用 bash 工具查看 `--out` 报告文件，将其中所有 failed / warning 检查项**如实**合并到步骤 6 JSON 的 test_results（name 加前缀「外部评测-」，status 用 failed/warning/passed，与报告保持一致），不得隐瞒、省略或篡改
+- 报告整体结论（verdict 与 summary）写入结果 JSON 的 external_evaluation 字段
+- 若评测出现 failed 项（如随机数核心逻辑、约束违反、标签越界、数据集评测劣于基线），必须回到【步骤 3】修复代码，再重新执行【步骤 5】与【5.5】，直到无 failed 项（重试上限 3 次）
+"""
+        note_external_eval = (
+            "\n10. 步骤 5.5 的外部确定性评测必须真实执行评测脚本，评测结果必须如实合并；"
+            "存在 failed 项时不得跳过修复直接保存结果"
+        )
+        # test_results 示例追加行（注意：内容需匹配最终 prompt 中 JSON 示例的双花括号风格）
+        eval_test_rows = (
+            ',\n        {{"name": "外部评测-随机数核心逻辑检测", "status": "passed", "details": "步骤 5.5 评测报告结果..."}},'
+            '\n        {{"name": "外部评测-数据集真实评测与基线对比", "status": "passed", "details": "..."}}'
+        )
+        eval_json_field = (
+            '\n    "external_evaluation": {{'
+            '\n        "verdict": "qualified | needs_review | unqualified",'
+            '\n        "summary": {{"passed": 10, "warning": 0, "failed": 0, "skipped": 2}},'
+            '\n        "failed_items": ["如有 failed 项，列出检查名"],'
+            '\n        "warning_items": ["如有 warning 项，列出检查名"],'
+            '\n        "report_file": "{model_name}_eval_report.json"'
+            '\n    }},'
+        )
+        eval_result_note = (
+            "\n- 若执行了步骤 5.5，test_results 必须包含全部「外部评测-」前缀的检查项（含 passed 项），"
+            "external_evaluation 字段必须与评测报告一致。"
+        )
+    else:
+        note_external_eval = ""
+        eval_test_rows = ""
+        eval_json_field = ""
+        eval_result_note = ""
+
     sections.append(f"""
 ---
 
@@ -312,30 +370,113 @@ def build_aml_auto_generate_prompt(
 - 哪些函数作为独立可封装的核心 API
 - `main_process` 主入口的职责边界{skill_guidance}{constraint_enforcement}
 
+### 步骤 2b：设计测试用例（在生成代码之前）
+基于输入输出规格，先设计至少 4 组测试用例并写入测试文件。测试用例是后续验证代码正确性的标准，代码必须全部通过。
+
+**设计要求：**
+- 测试 1（正常输入）：构造一个应触发默认/正常结果的输入，验证输出结构和值
+- 测试 2（边界/触发输入）：构造一个应触发某个特定结果的输入，验证输出值符合预期
+- 测试 3（异常/空输入）：构造空值或异常输入，验证不崩溃且有合理输出
+- 测试 4（脏输入，必选）：构造类型错乱的输入（如金额传字符串 `"abc"`、字段值为 None、未知垃圾键），验证 main_process 不抛异常、返回统一的降级结果（如 "无法判定" + confidence=0）——真实数据集常含脏值，逐行处理时一次崩溃即整批失败
+
+**将测试用例写入** `{workspace}/temp/{{model_name}}_test.py`，格式示例（根据实际规格调整）。
+
+**重要：如果模型名称包含连字符、中文等非法字符，必须先转为合法 Python 模块名（仅小写字母、数字、下划线）。** 例如 `ZWH-未知领域-001` 应转为 `zwh_unknown_domain_001`，代码文件和测试文件都使用转换后的名称。下方模板中的 `{{model_name}}` 占位符需替换为转换后的实际模块名。
+```python
+import sys
+sys.path.insert(0, '.')
+from {{model_name}}_algorithm import main_process
+
+def test_normal_input():
+    # 测试正常输入应返回默认/正常结果
+    # 用基于输入规格的真实测试数据替换下方参数
+    result = main_process()
+    assert isinstance(result, dict), f'返回类型错误: {{type(result)}}'
+    assert 'classification_label' in result, '缺少 classification_label 字段'
+    assert all(l in ['正常','可疑','高风险','疑似欺诈'] for l in result['classification_label']), '标签不在允许范围'
+    assert all(0 <= c <= 1 for c in result['confidence_list']), '置信度不在 0~1 范围'
+    print('test_normal_input 通过:', result)
+
+def test_trigger_input():
+    # 构造应触发特定结果的输入
+    # 用基于输入规格的、应触发特定结果的测试数据替换下方参数
+    result = main_process()
+    assert len(result['classification_label']) > 0, '分类标签为空'
+    print('test_trigger_input 通过:', result)
+
+def test_empty_input():
+    # 空值/异常输入不应崩溃
+    result = main_process()
+    assert isinstance(result, dict), '空输入返回类型错误'
+    print('test_empty_input 通过:', result)
+
+def test_dirty_input():
+    # 脏输入（类型错乱/None/垃圾键）不应崩溃，应优雅降级
+    result = main_process()
+    assert isinstance(result, dict), '脏输入返回类型错误: 应降级返回 dict，不得抛异常'
+    print('test_dirty_input 通过:', result)
+
+if __name__ == '__main__':
+    test_normal_input()
+    test_trigger_input()
+    test_empty_input()
+    test_dirty_input()
+    print('=== 所有测试通过 ===')
+```
+
+**重要：测试数据要基于算法的输入输出规格构造，不能用占位符。**
+
 ### 步骤 3：生成算法代码
 生成完整 Python 单文件代码，必须严格遵守已加载的 Skill 中的所有要求。
 如果系统加载了领域 Skill（如视频处理、姿态估计等），**必须** 参考其中的代码范例和技术路线。
+生成的代码必须能通过步骤 2b 中设计的所有测试用例。
 
 ### 步骤 4：保存代码文件
-使用 bash 工具将代码写入 `{workspace}/temp/{model_name}_algorithm.py`。
+使用 bash 工具将代码写入 `{workspace}/temp/{{model_name}}_algorithm.py`（使用转换后的模块名作为文件名）。
 
-### 步骤 5：代码质量自检（七维）
-对生成的代码逐项分析：
-1. 功能测试：代码逻辑是否正确实现了用户需求
-2. 平台提交规范：是否符合 `main_process` 入口、Google docstring 等要求
-3. 接口测试：函数签名和返回值是否匹配输入输出规格
-4. 性能测试：是否有明显的性能瓶颈或资源浪费
-5. 可靠性测试：是否有适当的异常处理和边界情况处理
-6. 安全性测试：是否有注入风险或不安全的外部调用
+### 步骤 5：代码验证（真实执行）
+**必须使用 bash 工具真实执行以下验证，不能跳过。如果验证失败，回到步骤 3 修复代码后重新保存并重新验证。**
+
+#### 5.1 语法编译检查
+使用 bash 工具执行：
+python3 -m py_compile {workspace}/temp/{{model_name}}_algorithm.py
+
+如果编译失败（有语法错误），回到【步骤 3】修复后重新保存。最多重试 3 次。
+
+#### 5.2 导入测试
+使用 bash 工具执行：
+cd {workspace}/temp && python3 -c "import {{model_name}}_algorithm; print('导入成功')"
+
+如果导入失败（缺少依赖或模块结构错误），回到【步骤 3】修复后重新保存。最多重试 3 次。
+
+#### 5.3 功能测试
+执行步骤 2b 中设计的测试文件，验证代码功能正确性：
+
+cd {workspace}/temp && python3 {{model_name}}_test.py
+
+该测试文件包含至少 4 组测试用例（正常输入、触发输入、空输入、脏输入），使用 assert 断言验证输出结构和语义。
+
+如果测试失败（assert 错误或异常），分析失败原因，回到【步骤 3】修复代码后重新保存，再次执行测试。最多重试 3 次。
+
+#### 5.4 七维质量分析
+基于 5.1-5.3 的真实执行结果，对代码逐项分析：
+1. 语法编译检查：py_compile 执行结果
+2. 导入测试：import 执行结果
+3. 功能测试：测试用例执行结果
+4. 平台提交规范：是否符合 `main_process` 入口、Google docstring 等要求
+5. 接口测试：函数签名和返回值是否匹配输入输出规格
+6. 可靠性测试：是否有适当的异常处理和边界情况处理
 7. 兼容性测试：依赖库版本是否兼容、是否跨平台
-
+{eval_section_55}
 ### 步骤 6：保存最终结果
 使用 bash 工具将 JSON 写入 `{workspace}/temp/aml_generate_result.json`，格式：
 ```json
 {{{{
     "model_name": "{model_name}",
     "generated_code": "<完整代码>",
-    "code_filename": "{model_name}_algorithm.py",
+    "code_filename": "{{model_name}}_algorithm.py",
+    "test_code": "<步骤 2b 写入的测试文件完整内容，一字不差>",
+    "test_filename": "{{model_name}}_test.py",
     "model_summary": {{{{
         "purpose": "用非技术用户能理解的中文说明：这个算法模型主要帮助用户完成什么任务",
         "input_description": "说明用户需要提供什么数据或材料，不要出现 bash、py_compile 等命令行细节",
@@ -345,8 +486,14 @@ def build_aml_auto_generate_prompt(
         "next_steps": ["建议用户后续补充的数据、规则或评价指标"]
     }}}},
     "test_results": [
-        {{{{"name": "功能测试", "status": "passed", "description": "...", "details": "..."}}}}
-    ],
+        {{{{"name": "语法编译检查", "status": "passed", "details": "py_compile 执行结果..."}}}},
+        {{{{"name": "导入测试", "status": "passed", "details": "导入成功..."}}}},
+        {{{{"name": "功能测试", "status": "passed", "details": "所有测试用例通过..."}}}},
+        {{{{"name": "平台提交规范", "status": "passed", "details": "..."}}}},
+        {{{{"name": "接口测试", "status": "passed", "details": "..."}}}},
+        {{{{"name": "可靠性测试", "status": "passed", "details": "..."}}}},
+        {{{{"name": "兼容性测试", "status": "passed", "details": "..."}}}}{eval_test_rows}
+    ],{eval_json_field}
     "references": [
         {{{{
             "type": "paper",
@@ -370,11 +517,12 @@ def build_aml_auto_generate_prompt(
 }}}}
 ```
 说明：
+- test_code 必须与步骤 2b 实际写入测试文件的内容完全一致，用于平台留存测试资产、支持后续用真实数据集复检（缺失该字段视为结果不完整）。
 - 即使用户未提供参考资料，也应基于通用现有算法填写 references（来源标 RAG知识库 或常识）与 differentiation_summary，
   说明本方案参考了什么、新增/提升了什么、对比现有算法有哪些特点与优势。
 - differentiation_summary 必须填写，用于向用户清晰展示「参考了…、新增了…、提升了…、对比优势…」。
 - model_summary 必须填写，且必须面向不懂技术的用户，避免展示 bash、cat、python3、py_compile、main_process 等命令行或工程实现细节。
-- 如果用户需求描述不完整、数据集缺失或参考资料不足，必须在 model_summary.limitations 与 model_summary.next_steps 中用友好语言说明。
+- 如果用户需求描述不完整、数据集缺失或参考资料不足，必须在 model_summary.limitations 与 model_summary.next_steps 中用友好语言说明。{eval_result_note}
 
 ### 步骤 7：完成任务
 确认 JSON 文件已保存后，调用 terminate 结束任务。
@@ -389,6 +537,8 @@ def build_aml_auto_generate_prompt(
 5. 如果有技术约束，在步骤 2 中必须逐条说明如何满足
 6. 若用户提供了「相关资料」，必须遵守上方「差异化与知识产权要求」，并完整填写 differentiation_summary
 7. 面向用户展示的 model_summary 必须通俗、简洁、可操作，不得暴露命令行执行过程或源码写入过程
+8. 步骤 5 的代码验证必须真实执行，不能跳过。如果验证失败，必须回到步骤 3 修复代码后重新保存并重新验证。test_results 必须如实记录每次验证的真实结果（passed/failed），不得伪造结果
+9. 步骤 2b 的测试用例必须在生成代码之前完成，测试数据要基于输入输出规格构造真实数据，不能用占位符。步骤 5.3 必须执行步骤 2b 生成的测试文件，且所有测试必须通过{note_external_eval}
 
 ## 硬性禁止（违反任一条将导致代码不合格）
 1. **禁止**使用 `random.choice()` / `random.randint()` / `random.uniform()` 作为分类、检测或预测的核心决策逻辑
@@ -396,6 +546,25 @@ def build_aml_auto_generate_prompt(
 3. **禁止**输出未在用户指定的标签/类别定义中列出的名称
 4. **禁止**引入与实际推理逻辑无关的依赖库（如声明了 torch 但仅用于生成随机张量）
 5. 每个核心函数都必须包含 **真实的** 数据处理和决策逻辑
+6. **禁止**无依据兜底：当算法无法判断时，必须返回明确的「无法判定」类结果或显著降低 confidence 字段，禁止静默返回默认类别/默认值伪装成正常判断结果
+7. **禁止**吞异常兜底：禁止 `except Exception: return 默认值` 式静默失败。异常必须被记录（写入返回值的 error/detail 字段）或重新抛出
+8. **依赖清单必须与实际 import 逐项一致**：头部 docstring 声明的每个依赖都必须被代码真实使用，实际使用的每个第三方库都必须声明（注意 pip 包名与导入名映射：opencv-python→cv2、scikit-learn→sklearn、pillow→PIL、PyYAML→yaml）
+9. **禁止**依赖 yt-dlp、ffmpeg 等外部命令行工具；确有需要时必须用 try/except 包裹调用并在 model_summary.limitations 中说明环境要求
+10. **禁止**无出处魔数阈值：关键判定阈值必须在代码中定义为具名常量并注释来源（用户需求/参考资料/数据统计）
+11. 使用 mediapipe、opencv 等存在 API 变更风险的库时，依赖声明必须带版本上界（如 `mediapipe>=0.10.0,<0.10.21`），并确认所用 API 在声明的版本区间内存在（例如 `mp.solutions.*` 旧版 API 在 mediapipe 新版本中已移除）
+12. **禁止**在 main_process 可达函数体内构造重型资源（姿态估计模型、级联分类器、from_pretrained 等）：每次调用都会重新加载，批量处理性能极差。必须采用模块级懒加载单例模式：
+```python
+_pose_detector = None
+
+def _get_pose_detector():
+    \"\"\"模块级懒加载单例：首次调用时初始化，之后复用。\"\"\"
+    global _pose_detector
+    if _pose_detector is None:
+        _pose_detector = mp.solutions.pose.Pose()
+    return _pose_detector
+```
+13. 单函数圈复杂度不得超过 15：分支/循环/异常处理组合过多时必须拆分为职责单一的子函数（平台评测对超标函数告警，超过 25 直接判不合格）
+14. **禁止**对脏输入抛异常：main_process 收到空字典、None 值、错误类型（如字符串金额）、极端数值、垃圾键时必须优雅降级，返回统一的降级格式 `{{"classification_label": "无法判定", "confidence": 0.0, "reason": "输入数据缺失或非法"}}`（回归/聚类等类别用对应输出键），不得崩溃退出
 
 现在开始执行任务，请从【步骤 1】开始。
 """)

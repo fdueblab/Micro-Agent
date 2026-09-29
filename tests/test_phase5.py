@@ -31,7 +31,7 @@ def test_llm_profiles_multiple():
     assert "fast" in cfg.llm_profiles
     assert "reasoning" in cfg.llm_profiles
     assert cfg.llm_profiles["fast"].max_tokens == 4096
-    assert cfg.llm_profiles["reasoning"].model == "openrouter/qwen/qwen3-coder-flash"
+    assert cfg.llm_profiles["reasoning"].model == "openai/qwen3-coder-flash"
 
 
 async def test_build_agent_with_profile():

@@ -1,0 +1,13 @@
+name = "financial_timeseries"
+description = "金融时间序列预测指导：防时序泄漏、朴素基线对比、滚动验证"
+
+# prompt 留空 → 自动从同目录 SKILL.md 读取
+
+[metadata.match]
+# 不设 categories：避免污染非时序回归任务，仅靠时序/金融关键词命中
+keywords = [
+    "汇率", "汇率预测", "股价", "股票", "价格预测", "走势", "交易量",
+    "时序", "时间序列", "序列预测", "预测下期", "下一期", "arima",
+    "exchange rate", "forex", "stock price", "timeseries", "time series",
+    "forecast", "trend", "mape", "滞后", "滑动窗口", "滚动",
+]

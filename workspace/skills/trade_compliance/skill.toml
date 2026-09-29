@@ -1,0 +1,12 @@
+name = "trade_compliance"
+description = "跨境贸易合规指导：名单筛查模糊匹配、HS编码归类、单证规则引擎"
+
+# prompt 留空 → 自动从同目录 SKILL.md 读取
+
+[metadata.match]
+keywords = [
+    "贸易", "跨境贸易", "海关", "报关", "申报", "关税", "hs编码", "hs code",
+    "商品归类", "制裁", "制裁名单", "名单筛查", "合规", "原产地", "贸易单证",
+    "单证审核", "提单", "发票审核", "结算单证", "出口", "进口", "进出口",
+    "trade", "customs", "sanction", "compliance", "screening", "declaration",
+]
