@@ -39,6 +39,7 @@ from pydantic import BaseModel
 
 from api.deps import build_agent, task_manager
 from api.services.files import (
+    _safe_filename,
     cleanup_paths,
     fetch_url_text,
     find_main_file,
@@ -67,28 +68,42 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 WORKSPACE = str(config.workspace)
 
 
+def _restore_python_filename(saved: Path, project_dir: str, original: str | None) -> None:
+    """Keep source module names stable after adding a unique upload prefix."""
+    if saved.suffix.lower() != ".py":
+        return
+    copied = Path(project_dir) / saved.name
+    target = Path(project_dir) / _safe_filename(original, "source.py")
+    if copied != target and copied.is_file():
+        copied.rename(target)
+
+
 # ============================================================
 #  端点：代码分析
 # ============================================================
 
 @router.post("/code_analysis")
 async def code_analysis(file: UploadFile = File(...)):
-    saved = await save_upload(file, Path(WORKSPACE))
-    project_dir = resolve_project_dir(saved, Path(WORKSPACE))
+    run_dir = Path(WORKSPACE) / "temp" / "mcp_analysis" / uuid.uuid4().hex
+    saved = await save_upload(file, run_dir)
+    project_dir = resolve_project_dir(saved, run_dir)
+    _restore_python_filename(saved, project_dir, file.filename)
     main_code = find_main_file(project_dir)
+    output_dir = run_dir / "result"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = render_prompt(
         "code_analysis.md.j2",
         workspace=WORKSPACE, input_dir=project_dir, main_code=main_code,
-        temp_dir="temp", function_info_path="function.json",
+        temp_dir=str(output_dir), function_info_path="function.json",
     )
     agent, _ = await build_agent(name="code_analysis", system_prompt=get_task("code_analysis").system_prompt)
     ctx = await task_manager.submit(agent, prompt)
 
     return await sse_response(
         ctx,
-        output_files=[{"name": "function", "file": f"{WORKSPACE}/temp/function.json"}],
-        cleanup=partial(cleanup_paths, str(saved), project_dir),
+        output_files=[{"name": "function", "file": str(output_dir / "function.json")}],
+        cleanup=partial(cleanup_paths, str(run_dir)),
     )
 
 
@@ -124,13 +139,30 @@ async def _get_packaging_retriever():
 async def service_packaging(
     file: UploadFile = File(...),
     session_id: Optional[str] = Form(default=None),
+    packaging_spec: str = Form(default=""),
 ):
-    saved = await save_upload(file, Path(WORKSPACE))
-    project_dir = resolve_project_dir(saved, Path(WORKSPACE))
+    spec = None
+    if packaging_spec:
+        try:
+            spec = json.loads(packaging_spec)
+            if not isinstance(spec, dict) or not isinstance(spec.get("tools"), list):
+                raise ValueError("tools 必须是数组")
+            if len(packaging_spec) > 30000:
+                raise ValueError("想定内容过长")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, f"封装想定格式错误: {exc}") from exc
+    run_dir = Path(WORKSPACE) / "temp" / "mcp_packages" / uuid.uuid4().hex
+    saved = await save_upload(file, run_dir)
+    project_dir = resolve_project_dir(saved, run_dir)
+    _restore_python_filename(saved, project_dir, file.filename)
     main_code = find_main_file(project_dir)
-    output_dir = f"{WORKSPACE}/app-demo-output"
+    output_dir = str(run_dir / "output")
 
-    retriever = await _get_packaging_retriever()
+    try:
+        retriever = await _get_packaging_retriever()
+    except Exception as exc:
+        logger.warning("服务封装知识检索不可用，继续使用封装 Skill: {}", exc)
+        retriever = None
 
     skill_names = ["mcp_protocol", "docker_packaging", "code_analysis_patterns"]
     llm_profile = "reasoning"
@@ -160,14 +192,21 @@ async def service_packaging(
     prompt = render_prompt(
         "service_packaging.md.j2",
         workspace=WORKSPACE, input_dir=project_dir, main_code=main_code,
-        output_dir=output_dir, temp_dir="temp", function_info_path="function.json",
+        output_dir=output_dir, temp_dir=str(run_dir / "analysis"), function_info_path="",
     )
+    if spec:
+        prompt += (
+            "\n\n以下是用户确认的封装想定。只封装源码里实际存在的函数；若函数不存在或参数无法对应，"
+            "明确报错并停止，不得编造实现或成功产物。工具名称、描述和参数应与本想定一致。"
+            "在输出目录写入 mcp-manifest.json，包含想定及实际生成的工具信息。"
+            "\n封装想定 JSON：\n" + json.dumps(spec, ensure_ascii=False)
+        )
     ctx = await task_manager.submit(agent, prompt)
 
     return await sse_response(
         ctx,
         zip_dir=output_dir,
-        cleanup=partial(cleanup_paths, str(saved), project_dir),
+        cleanup=partial(cleanup_paths, str(run_dir)),
         session_id=sid,
         components_meta=components_meta,
     )
@@ -1018,6 +1057,50 @@ async def meta_app_run(
 # ============================================================
 #  端点：能力描述翻译（直接 LLM 调用）
 # ============================================================
+
+@router.post("/mcp_packaging_intake")
+async def mcp_packaging_intake(
+    message: str = Form(...),
+    partial_form: str = Form(default="{}"),
+    candidates: str = Form(default="[]"),
+):
+    """Suggest business intent fields; source functions remain user-confirmed."""
+    if not message.strip() or len(message) > 4000:
+        raise HTTPException(400, "请用 1 至 4000 字描述封装需求")
+    try:
+        form = json.loads(partial_form)
+        functions = json.loads(candidates)
+        if not isinstance(form, dict) or not isinstance(functions, list):
+            raise ValueError("字段类型错误")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, "想定上下文格式错误") from exc
+    prompt = (
+        "你帮助用户将已有 Python 算法封装为 MCP 工具。请仅从用户的话中提炼业务意图，"
+        "不要编造函数、参数或医学/业务结论，也不要选择要暴露的工具。"
+        "只返回 JSON 对象，字段 updates（可含 service_name、scenario、target_users，后者是字符串数组）"
+        "和 question（仍缺关键信息时的一句追问，否则为空字符串）。保留用户已有信息。\n"
+        f"已有表单：{json.dumps(form, ensure_ascii=False)[:5000]}\n"
+        f"源码函数候选：{json.dumps(functions, ensure_ascii=False)[:5000]}\n"
+        f"用户的新描述：{message}"
+    )
+    try:
+        response = await LLM(config.llm).complete([{"role": "user", "content": prompt}], temperature=0.2)
+        raw = response.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(line for line in raw.splitlines() if not line.strip().startswith("```"))
+        parsed = json.loads(raw)
+        updates = parsed.get("updates") or {}
+        allowed = {"service_name", "scenario", "target_users"}
+        updates = {key: value for key, value in updates.items() if key in allowed}
+        for key in ("service_name", "scenario"):
+            if key in updates and not isinstance(updates[key], str):
+                updates.pop(key)
+        if "target_users" in updates and not (isinstance(updates["target_users"], list) and all(isinstance(item, str) for item in updates["target_users"])):
+            updates.pop("target_users")
+        return {"updates": updates, "question": str(parsed.get("question") or "")[:500]}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(502, "想定助手返回内容无法解析") from exc
+
 
 @router.post("/capability_describe")
 async def capability_describe(

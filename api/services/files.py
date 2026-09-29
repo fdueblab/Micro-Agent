@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import shutil
+import stat
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +79,16 @@ async def save_upload(upload: UploadFile, dest_dir: Path) -> Path:
 def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
+        entries = zf.infolist()
+        if len(entries) > 2000 or sum(item.file_size for item in entries) > 200 * 1024 * 1024:
+            raise HTTPException(400, "ZIP 文件内容过大")
+        root = dest_dir.resolve()
+        for item in entries:
+            name = item.filename.replace("\\", "/")
+            target = (dest_dir / name).resolve()
+            if (name.startswith("/") or ".." in Path(name).parts
+                    or not target.is_relative_to(root) or stat.S_ISLNK(item.external_attr >> 16)):
+                raise HTTPException(400, "ZIP 文件包含不安全路径或符号链接")
         zf.extractall(dest_dir)
     logger.info(f"ZIP 已解压: {zip_path} -> {dest_dir}")
     return dest_dir
