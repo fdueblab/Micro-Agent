@@ -15,8 +15,10 @@ from loguru import logger
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 try:
+    # MCP SDK v2 and recent v1 releases.
     from mcp.client.streamable_http import streamable_http_client
 except ImportError:
+    # MCP SDK v1 (for example 1.18.0) used this spelling.
     from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
 from micro_agent.tool.mcp.sse_transport import sse_client
