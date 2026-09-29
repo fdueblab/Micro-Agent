@@ -73,6 +73,7 @@ async def sse_response(
 
         try:
             yield _sse_line({"status": "start"})
+            failed = False
 
             if components_meta:
                 yield _sse_line({"status": "components", **components_meta})
@@ -82,6 +83,8 @@ async def sse_response(
 
             async for event in ctx.subscribe():
                 if event.type in ("error", "done"):
+                    if event.type == "error" or event.data.get("reason") == "cancelled":
+                        failed = True
                     if pending_step:
                         yield _sse_line(pending_step)
                         pending_step = {}
@@ -106,9 +109,12 @@ async def sse_response(
             final: dict[str, Any] = {"is_last": True, "is_final_result": True}
             final_results: dict[str, Any] = {}
 
-            if zip_dir and os.path.isdir(zip_dir):
+            if zip_dir and ctx.status == "completed" and not failed and os.path.isdir(zip_dir):
                 try:
                     zip_path = Path(zip_dir)
+                    required = ("server.py", "Dockerfile", "docker-compose.yml")
+                    if not all((zip_path / name).is_file() for name in required):
+                        raise ValueError("封装产物不完整")
                     final_results["service_package"] = pack_directory_as_zip_base64(zip_dir)
                     final_results["output_files"] = [
                         {"name": f.name, "size": f.stat().st_size}
@@ -117,7 +123,7 @@ async def sse_response(
                 except Exception as e:
                     final_results["error"] = f"压缩目录失败: {e}"
 
-            if output_files and not zip_dir:
+            if output_files and not zip_dir and ctx.status == "completed" and not failed:
                 for spec in output_files:
                     name, fpath = spec["name"], spec["file"]
                     try:
@@ -133,6 +139,8 @@ async def sse_response(
 
             if final_results:
                 final["final_results"] = final_results
+            if failed or ctx.status != "completed":
+                final["error"] = f"任务未成功完成（{ctx.status}）"
 
             yield _sse_line(final)
 

@@ -16,6 +16,7 @@ from loguru import logger
 from api.routes.task import router as task_router
 from api.routes.agent import router as agent_router
 from api.routes.simulation import router as simulation_router
+from api.routes.mcp_internal import router as mcp_internal_router
 from micro_agent.core.config import config
 from micro_agent.core.skill import SkillRegistry
 
@@ -62,6 +63,7 @@ app.add_middleware(
 app.include_router(task_router)
 app.include_router(agent_router)
 app.include_router(simulation_router)
+app.include_router(mcp_internal_router)
 
 
 @app.get("/health")

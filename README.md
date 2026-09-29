@@ -225,6 +225,12 @@ Micro-Agent/
 └── deploy/               # Docker 部署
 ```
 
+## 众智工场 MCP 封装集成
+
+新网站的封装任务由 `ioeb_backend` 鉴权后转发给本服务。配置与后端一致的 `MCP_INTERNAL_TOKEN`，后端通过 `MCP_AGENT_BASE_URL` 访问本服务。`POST /api/agent/mcp_packaging_intake` 辅助补全业务想定，`POST /api/agent/service_packaging` 接受 `packaging_spec` JSON 表单字段并生成独立任务产物。`POST /api/internal/mcp/check` 仅接受匹配内部令牌的后端请求，用于连接已登记的 MCP 服务并验证工具或执行测试调用。
+
+本地联调时先启动 Agent 和后端，再启动 `zhongzhi-factory`；后端部署的 MCP 网关地址需可由 Agent 访问。旧版 SSE 封装保持兼容，发布前的真实协议检查通过后端进行。
+
 ## 许可
 
 [MIT](LICENSE)

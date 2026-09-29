@@ -14,7 +14,10 @@ from loguru import logger
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamable_http_client
+try:
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError:
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
 from micro_agent.tool.mcp.sse_transport import sse_client
 from micro_agent.tool.mcp.tool import MCPTool
