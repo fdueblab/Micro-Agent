@@ -11,6 +11,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException, UploadFile
@@ -199,15 +200,30 @@ def pack_directory_as_zip_base64(directory: str) -> dict:
 
 
 def read_paper_content(file_path: str) -> str:
-    """从 PDF / DOC / DOCX 文件中提取文本内容。"""
+    """从 PDF / DOCX 文件中提取文本，保留 PDF 页码供公式核对。"""
     _, ext = os.path.splitext(file_path.lower())
     content = ""
     try:
         if ext == ".pdf":
-            from PyPDF2 import PdfReader
-            reader = PdfReader(file_path)
-            for page in reader.pages:
-                content += (page.extract_text() or "")
+            try:
+                import pymupdf
+            except ImportError:
+                # Older installations can still preview clean PDFs. The route rejects
+                # replacement characters instead of asking users to approve corrupt text.
+                from PyPDF2 import PdfReader
+                reader = PdfReader(file_path)
+                for index, page in enumerate(reader.pages, start=1):
+                    content += f"\n\n[第 {index} 页]\n" + (page.extract_text() or "")
+            else:
+                with pymupdf.open(file_path) as document:
+                    for index, page in enumerate(document, start=1):
+                        text = page.get_text()
+                        # Some PDFs encode the Latin 'ti' ligature as U+019F. The NKF
+                        # CKD-EPI implementation PDF uses this broken mapping throughout.
+                        if re.search(r"[A-Za-z]\u019f[a-z]|\u019f[a-z]{2}", text):
+                            text = text.replace("\u019f", "ti")
+                        text = text.replace("\ufb01", "fi").replace("\ufb02", "fl")
+                        content += f"\n\n[第 {index} 页]\n{text}"
         elif ext in (".doc", ".docx"):
             from docx import Document
             doc = Document(file_path)
@@ -216,6 +232,11 @@ def read_paper_content(file_path: str) -> str:
     except Exception as e:
         logger.warning(f"提取文件内容失败 ({file_path}): {e}")
     return content
+
+
+def paper_text_is_corrupt(text: str) -> bool:
+    """Detect characters whose PDF-to-Unicode mapping remains unreadable."""
+    return "\ufffd" in text or "\u019f" in text
 
 
 def read_reference_text(file_path: str, max_chars: int = 4000) -> str:
@@ -255,12 +276,30 @@ def read_reference_text(file_path: str, max_chars: int = 4000) -> str:
     return (content or "")[:max_chars]
 
 
+_REFERENCE_HOSTS = {
+    "doi.org", "www.doi.org", "arxiv.org", "www.arxiv.org",
+    "pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov",
+    "patents.google.com", "clinicaltrials.gov", "www.clinicaltrials.gov",
+}
+
+
+def valid_reference_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and parsed.hostname in _REFERENCE_HOSTS and parsed.port in (None, 443)
+    except ValueError:
+        return False
+
+
 async def fetch_url_text(url: str, max_chars: int = 4000) -> str:
     """抓取 URL 的可读文本（简单去标签）。失败返回空字符串。"""
     import re
 
+    if not valid_reference_url(url):
+        raise ValueError("参考网址仅支持 DOI、PubMed、PMC、arXiv、Google Patents 和 ClinicalTrials.gov 的 HTTPS 地址")
+
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 Micro-Agent"})
             if resp.status_code != 200:
                 logger.warning(f"抓取 URL 失败 [{resp.status_code}]: {url}")

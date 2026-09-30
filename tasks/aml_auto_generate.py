@@ -207,7 +207,10 @@ def build_aml_auto_generate_prompt(
     if technology:
         sections.append(f"\n## 技术方向\n{technology}")
     if paper_content:
-        sections.append(f"\n## 想定式描述文件内容\n{paper_content[:3000]}")
+        paper_limit = 30000 if domain == "clinical" and generation_mode == "reproduce" else 3000
+        sections.append(f"\n## 想定式描述文件内容\n{paper_content[:paper_limit]}")
+        if len(paper_content) > paper_limit:
+            sections.append("\n资料正文超过当前生成上下文长度；本次只读取了前述内容，不能宣称已完整复现未读取部分。请指定目标页码并缩小资料范围。")
 
     # ── 数据集上下文 ──
     if dataset_info and dataset_info.get("raw_text"):
@@ -245,7 +248,7 @@ def build_aml_auto_generate_prompt(
             "\n## 用户提供的参考资料\n\n"
             "以下是用户提交的「相关资料」（可能包含论文、专利、开源代码、网址内容或说明），"
             "用于指导本次算法模型的优化方向：\n\n"
-            f"{reference_materials[:6000]}\n"
+            f"{reference_materials[:12000 if domain == 'clinical' and generation_mode == 'reproduce' else 6000]}\n"
         )
         if domain != "clinical":
             sections.append(
