@@ -42,8 +42,10 @@ from api.services.files import (
     _safe_filename,
     cleanup_paths,
     fetch_url_text,
+    valid_reference_url,
     find_main_file,
     parse_dataset_file,
+    paper_text_is_corrupt,
     read_paper_content,
     read_reference_text,
     resolve_file_or_url,
@@ -652,6 +654,28 @@ async def _get_aml_retriever(domain: str = ""):
     return retriever
 
 
+@router.post("/reference_preview")
+async def reference_preview(file: UploadFile = File(...)):
+    """Return extracted text so a researcher can check formulas before generation."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".pdf", ".docx"):
+        raise HTTPException(400, "主资料仅支持 PDF 或 DOCX")
+    content = await file.read(10 * 1024 * 1024 + 1)
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(400, "资料大小不能超过 10 MB")
+    await file.seek(0)
+    saved = await save_upload(file, Path(WORKSPACE) / "temp" / "references")
+    try:
+        extracted = read_paper_content(str(saved))
+        if not extracted.strip() or not any(char.isalnum() for char in extracted):
+            raise HTTPException(422, "未提取到可用正文；扫描件请先进行 OCR 后再上传")
+        if paper_text_is_corrupt(extracted):
+            raise HTTPException(422, "PDF 字体编码导致文字或公式无法可靠提取；请使用 OCR 生成可搜索 PDF 后重试，并核对原页")
+        return {"filename": file.filename, "text": extracted[:30000], "truncated": len(extracted) > 30000}
+    finally:
+        cleanup_paths(saved)
+
+
 @router.post("/aml_auto_generate")
 async def aml_auto_generate(
     model_name: str = Form(...),
@@ -682,11 +706,15 @@ async def aml_auto_generate(
     try:
         if file and file.filename:
             ext = os.path.splitext(file.filename)[1].lower()
-            if ext not in (".pdf", ".doc", ".docx"):
-                raise HTTPException(400, f"不支持的文件类型: {ext}。仅支持 .pdf / .doc / .docx")
+            if ext not in (".pdf", ".docx"):
+                raise HTTPException(400, f"不支持的文件类型: {ext}。仅支持 .pdf / .docx")
             saved = await save_upload(file, Path(WORKSPACE))
             cleanup_files.append(str(saved))
             paper_content = read_paper_content(str(saved))
+            if domain == "clinical" and generation_mode == "reproduce" and not paper_content.strip():
+                raise HTTPException(422, "主资料未提取到正文，请先检查 PDF 文本层或进行 OCR")
+            if domain == "clinical" and generation_mode == "reproduce" and paper_text_is_corrupt(paper_content):
+                raise HTTPException(422, "主资料包含无法可靠识别的字符，请先进行 OCR 或提供可搜索 PDF")
             logger.info(f"描述文件已保存并提取文本 ({len(paper_content)} 字符)")
 
         if dataset_file and dataset_file.filename:
@@ -712,13 +740,19 @@ async def aml_auto_generate(
                 try:
                     ref_saved = await save_upload(rf, Path(WORKSPACE) / "temp" / "references")
                     cleanup_files.append(str(ref_saved))
-                    ref_text = read_reference_text(str(ref_saved))
+                    ref_text = read_reference_text(str(ref_saved), max_chars=12000 if domain == "clinical" and generation_mode == "reproduce" else 4000)
+                    if domain == "clinical" and generation_mode == "reproduce" and not ref_text.strip():
+                        raise HTTPException(422, f"补充资料 {rf.filename} 未提取到正文")
+                    if domain == "clinical" and generation_mode == "reproduce" and paper_text_is_corrupt(ref_text):
+                        raise HTTPException(422, f"补充资料 {rf.filename} 含无法可靠识别的字符，请先进行 OCR")
                     if ref_text.strip():
                         reference_sections.append(
                             f"【资料文件：{rf.filename}】\n{ref_text}"
                         )
                         ref_keywords.append(os.path.splitext(rf.filename)[0])
                     logger.info(f"参考资料文件已提取: {rf.filename} ({len(ref_text)} 字符)")
+                except HTTPException:
+                    raise
                 except Exception as e:
                     logger.warning(f"处理参考资料文件失败 ({getattr(rf, 'filename', '?')}): {e}")
 
@@ -729,6 +763,8 @@ async def aml_auto_generate(
         for url_idx, url in enumerate(url_list):
             if not url:
                 continue
+            if not valid_reference_url(str(url)):
+                raise HTTPException(status_code=400, detail="参考网址仅支持 DOI、PubMed、PMC、arXiv、Google Patents 和 ClinicalTrials.gov 的 HTTPS 地址；其他来源请上传 PDF 或 DOCX")
             url_text = await fetch_url_text(str(url))
             if url_text.strip():
                 reference_sections.append(f"【参考网址：{url}】\n{url_text}")

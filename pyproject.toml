@@ -37,7 +37,7 @@ api = [
     "xlrd>=2.0.1",
 ]
 mcp = ["mcp>=1.4.0", "pymysql>=1.1.0"]
-rag = ["PyPDF2>=3.0.0", "python-docx>=1.0.0"]
+rag = ["PyPDF2>=3.0.0", "PyMuPDF>=1.24.0", "python-docx>=1.0.0"]
 all = ["fdu-micro-agent[api,mcp,rag]"]
 dev = [
     "fdu-micro-agent[all]",
