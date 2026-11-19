@@ -105,7 +105,14 @@ class TaskManager:
             async for event in ctx._agent.run(request):
                 await ctx.add_event(event)
             if ctx.status == "running":
-                ctx.status = "completed"
+                if any(e.type == "error" for e in ctx.events):
+                    ctx.status = "failed"
+                elif any(e.data.get("reason") == "cancelled" for e in ctx.events):
+                    ctx.status = "cancelled"
+                elif any(e.type == "done" and not e.data.get("reason") for e in ctx.events):
+                    ctx.status = "completed"
+                else:
+                    ctx.status = "failed"
         except asyncio.CancelledError:
             if not self._has_cancelled_event(ctx):
                 await ctx.add_event(

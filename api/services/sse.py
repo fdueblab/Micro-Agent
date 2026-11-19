@@ -80,8 +80,27 @@ async def sse_response(
 
             pending_step: dict[str, Any] = {}
             pending_step_num: int | None = None
+            last_clinical_stage = None
 
             async for event in ctx.subscribe():
+                if event.data.get("clinical_stage"):
+                    yield _sse_line({"clinical_stage": event.data["clinical_stage"]})
+                    last_clinical_stage = event.data["clinical_stage"]
+                for spec in output_files or []:
+                    folder = Path(spec["file"]).parent
+                    if "clinical-runs" in folder.parts:
+                        if (folder / "stage.json").exists():
+                            continue
+                        stage = "reading"
+                        if (folder / "evidence.json").is_file():
+                            stage = "rules"
+                        if (folder / "algorithm.py").is_file():
+                            stage = "implementation"
+                        if (folder / "tests.py").is_file():
+                            stage = "verification"
+                        if stage != last_clinical_stage:
+                            yield _sse_line({"clinical_stage": stage})
+                            last_clinical_stage = stage
                 if event.type in ("error", "done"):
                     if event.type == "error" or event.data.get("reason") == "cancelled":
                         failed = True
