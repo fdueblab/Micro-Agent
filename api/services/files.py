@@ -63,7 +63,8 @@ async def save_upload(upload: UploadFile, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = _safe_filename(upload.filename)
-    dest = dest_dir / f"{ts}_{safe_name}"
+    from uuid import uuid4
+    dest = dest_dir / f"{ts}_{uuid4().hex}_{safe_name}"
 
     # 兜底校验：确保最终路径仍在 dest_dir 内，防止未来逻辑改动引入回归。
     resolved_dest = dest.resolve()

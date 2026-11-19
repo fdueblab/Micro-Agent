@@ -693,6 +693,7 @@ async def aml_auto_generate(
     reference_files: list[UploadFile] = File(default=[]),
     reference_urls: str = Form(""),
     reference_notes: str = Form(""),
+    resume_token: str = Form(""),
     session_id: Optional[str] = Form(default=None),
 ):
     from tasks.aml_auto_generate import build_aml_auto_generate_prompt
@@ -795,6 +796,13 @@ async def aml_auto_generate(
         )
         if domain == "clinical" and "domain_clinical" not in skill_names:
             skill_names.append("domain_clinical")
+        if domain == "clinical":
+            skill_names = [name for name in skill_names if name not in {
+                "financial_risk_modeling", "financial_timeseries", "trade_compliance",
+            }]
+            if generation_mode == "reproduce":
+                skill_names = ["domain_clinical", "clinical_paper_evidence",
+                               "clinical_score_reproduction", "clinical_reproduction_validation"]
         logger.info(f"自动匹配 Skill: {skill_names}")
 
         # RAG 预检索：用聚焦查询代替完整 prompt，提高检索精度
@@ -898,6 +906,15 @@ async def aml_auto_generate(
         }
 
         output_path = f"{WORKSPACE}/temp/aml_generate_{uuid.uuid4().hex}.json"
+        clinical_reproduction = domain == "clinical" and generation_mode == "reproduce"
+        if clinical_reproduction:
+            from api.services.clinical_runs import prepare_run
+            run_folder = prepare_run(WORKSPACE, json.dumps([model_name, free_narrative, reference_materials,
+                category_params, paper_content], ensure_ascii=False),
+                saved if file and file.filename else None, resume_token)
+            output_path = str(run_folder / "result.json")
+            from api.services.clinical_document import extract_document
+            await asyncio.to_thread(extract_document, run_folder)
         prompt = build_aml_auto_generate_prompt(
             model_name=model_name,
             free_narrative=free_narrative,
@@ -919,19 +936,29 @@ async def aml_auto_generate(
             result_path=output_path,
         )
 
+        if clinical_reproduction:
+            from tasks.clinical_pipeline import ClinicalReproductionAgent
+            agent = ClinicalReproductionAgent(agent.llm, run_folder)
         ctx = await task_manager.submit(agent, prompt)
+        if clinical_reproduction:
+            from api.services.clinical_runs import retain_outcome
+            observer = asyncio.create_task(retain_outcome(ctx, run_folder))
+            observer.add_done_callback(task_manager._consume_runner_result)
 
         output_files = [
             {"name": "aml_generate_result", "file": output_path},
         ]
 
-        return await sse_response(
+        response = await sse_response(
             ctx,
             output_files=output_files,
-            cleanup=partial(cleanup_paths, *cleanup_files, output_path),
+            cleanup=None if clinical_reproduction else partial(cleanup_paths, *cleanup_files, output_path),
             session_id=sid,
             components_meta=components_meta,
         )
+        if clinical_reproduction:
+            response.headers["X-Clinical-Run"] = run_folder.name
+        return response
 
     except HTTPException:
         raise
@@ -941,6 +968,25 @@ async def aml_auto_generate(
             if os.path.exists(fp):
                 os.remove(fp)
         raise HTTPException(500, f"处理请求时出错: {e}")
+
+
+@router.get("/clinical-runs/{token}")
+async def clinical_run_status(token: str):
+    from api.services.clinical_runs import run_path, read_json, atomic_json
+    try:
+        folder = run_path(WORKSPACE, token)
+    except ValueError:
+        raise HTTPException(404, "执行记录不存在")
+    manifest = read_json(folder / "manifest.json")
+    if not isinstance(manifest, dict):
+        raise HTTPException(404, "执行记录不存在")
+    ctx = task_manager.get(manifest.get("task_id", ""))
+    if manifest.get("status") in {"running", "starting"} and ctx is None:
+        manifest["status"] = "interrupted"
+        atomic_json(folder / "manifest.json", manifest)
+    return {"status": manifest.get("status"), "error": manifest.get("error"),
+            "reused": manifest.get("reused", []),
+            "result": read_json(folder / "delivery.json") if manifest.get("status") == "completed" else None}
 
 
 def _resolve_skills_for_category(

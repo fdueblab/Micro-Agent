@@ -177,6 +177,13 @@ def build_aml_auto_generate_prompt(
     generation_mode: str = "new_design",
     result_path: str = "",
 ) -> str:
+    if domain == "clinical" and generation_mode == "reproduce" and result_path:
+        from tasks.clinical_reproduction import build_clinical_reproduction_prompt
+        return build_clinical_reproduction_prompt(
+            model_name=model_name, free_narrative=free_narrative,
+            paper_content=paper_content, result_path=result_path,
+            reference_materials=reference_materials,
+        )
     sections: list[str] = []
     params = category_params or {}
 
