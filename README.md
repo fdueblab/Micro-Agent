@@ -1,3 +1,7 @@
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/fdueblab/Micro-Agent/version.svg)](https://yarkr.com/arks/fdueblab/micro-agent)
+<!-- yarkr:badges:end -->
+
 <div align="center">
 
 <img src="docs/banner.png" alt="Micro-Agent" width="100%">
@@ -234,3 +238,37 @@ Micro-Agent/
 ## 许可
 
 [MIT](LICENSE)
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/fdueblab/micro-agent) as the ark [fdueblab/micro-agent](https://yarkr.com/arks/fdueblab/micro-agent), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync fdueblab/micro-agent
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:fdueblab/micro-agent/clinical-paper-evidence
+npx yarkr-cli add skill:fdueblab/micro-agent/clinical-reproduction-validation
+npx yarkr-cli add skill:fdueblab/micro-agent/clinical-score-reproduction
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add fdueblab/micro-agent
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/fdueblab/micro-agent`.
+<!-- yarkr:install:end -->
